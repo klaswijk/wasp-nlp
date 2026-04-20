@@ -1,14 +1,26 @@
 
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutput
 
 
 class A2ModelConfig(PretrainedConfig):
     """Configuration object that stores hyperparameters that define the Transformer language model."""
-    def __init__(self, vocab_size=None, hidden_size=None, intermediate_size=None, num_attention_heads=None, 
-                 num_hidden_layers=None,
-                 rope_theta=None, hidden_act='silu', max_position_embeddings=None, rms_norm_eps=None, **kwargs):
+    def __init__(
+        self, 
+        vocab_size=None, 
+        hidden_size=None, 
+        intermediate_size=None, 
+        num_attention_heads=None, 
+        num_layers=None,
+        rope_theta=10_000, 
+        hidden_act='silu', 
+        max_position_embeddings=None, 
+        rms_norm_eps=1e-6,
+        **kwargs
+    ):
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -18,8 +30,7 @@ class A2ModelConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-
+        self.num_layers = num_layers
 
 
 class A2MLP(nn.Module):
@@ -28,20 +39,27 @@ class A2MLP(nn.Module):
         super().__init__()
         assert(config.hidden_act == 'silu')
         # TODO: initalize components here
+        intermediate_size = config.intermediate_size or int(8 /3 * config.hidden_size)
+        self.in_proj = nn.Linear(config.hidden_size, intermediate_size * 2, bias=False)
+        self.out_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+
+        nn.init.trunc_normal_(self.in_proj.weight, std=0.02)
+        nn.init.trunc_normal_(self.out_proj.weight, std=0.02)
 
     def forward(self, hidden_states):
-        ...
+        value, gate = self.in_proj(hidden_states).chunk(2, dim=-1)
+        return self.out_proj(value * F.silu(gate))
 
 # This is optional, since you can use PyTorch's RMSNorm.
-class A2RMSNorm(nn.Module):
-    """RMS layer normalization."""
-    def __init__(self, config):
-        super().__init__()
-        # TODO: Use config.rms_norm_eps
-        # TODO: initalize weights here
+# class A2RMSNorm(nn.Module):
+#     """RMS layer normalization."""
+#     def __init__(self, config):
+#         super().__init__()
+#         # TODO: Use config.rms_norm_eps
+#         # TODO: initalize weights here
 
-    def forward(self, hidden_states):
-        ...
+#     def forward(self, hidden_states):
+#         ...
 
 
 class A2Attention(nn.Module):
@@ -51,9 +69,34 @@ class A2Attention(nn.Module):
         super().__init__()
         # TODO: set up W_q, W_k, W_v, W_o here
         # TODO: set up normalizers here
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.q_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+        nn.init.trunc_normal_(self.q_proj.weight, std=0.02)
+        nn.init.trunc_normal_(self.k_proj.weight, std=0.02)
+        nn.init.trunc_normal_(self.v_proj.weight, std=0.02)
+        nn.init.trunc_normal_(self.out_proj.weight, std=0.02)
 
     def forward(self, hidden_states, rope_rotations):
-        ...
+        q = self.q_norm(self.q_proj(hidden_states))
+        k = self.k_norm(self.k_proj(hidden_states))
+        v = self.v_proj(hidden_states)
+        
+        b, s, d = q.shape
+        q = q.view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, s, self.num_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rotary_pos_emb(q, k, rope_rotations)
+        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn_out = attn_out.transpose(1, 2).reshape(b, s, d)
+
+        return self.out_proj(attn_out)
 
 
 class A2DecoderLayer(nn.Module):
@@ -61,15 +104,24 @@ class A2DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
         # TODO: set up attention, MLP, and normalizers here.
+        self.attn = A2Attention(config)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = A2MLP(config)
+        self.mlp_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, rope_rotations):
-        ...
+        attn_out = self.attn_norm(self.attn(hidden_states, rope_rotations))
+        hidden_states = hidden_states + attn_out
+        mlp_out = self.mlp_norm(self.mlp(hidden_states))
+        hidden_states = hidden_states + mlp_out
+        return hidden_states
 
 
 class A2Transformer(PreTrainedModel):
     """A language model based on the Transformer architecture."""
     
     config_class = A2ModelConfig
+    _dynamic_tied_weights_keys = ["unembedding.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -78,16 +130,50 @@ class A2Transformer(PreTrainedModel):
         # TODO: Set up the other components here.
         # TODO: put all transformer decoder layers in a ModuleList.
 
+        self.embedding = nn.Embedding(config.vocab_size, config.embedding_size)
+        self.layers = nn.ModuleList([A2DecoderLayer(config) for _ in range(config.num_layers)])
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.unembedding = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.loss_func = torch.nn.CrossEntropyLoss(ignore_index=-100)
+
+        # Tie weights and initialize
+        self.tie_weights()
+        nn.init.trunc_normal_(self.embedding.weight, std=0.02)
+
         # This line should be called after you have set up all components.
         self.post_init()
 
+    def tie_weights(self):
+        self.unembedding.weight = self.embedding.weight
 
     def forward(self, input_ids, labels=None):
         rope_rotations = self.rotary_emb(input_ids) # pass this to all the transformer decoder layers
 
         # TODO: Call embedding, transformer decoder layers, last normalizer, and unembedding.
         # TODO: Compute the loss as in Assignment 1 if labels is not None.
-        ...
+        
+        embedded = self.embedding(input_ids)
+        for layer in self.layers:
+            embedded = layer(embedded, rope_rotations)
+        embedded = self.norm(embedded)
+        logits = self.unembedding(embedded)
+        if labels is not None:
+            # Logits are (batch_size, seq_length, vocab_size) and labels are (batch_size, seq_length)
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+            loss = self.loss_func(shift_logits, shift_labels)
+            
+            # Add z-loss used in OLMo-2
+            log_z = torch.logsumexp(shift_logits, dim=-1)
+            z_loss = (log_z ** 2).mean()
+            loss = loss + 1e-4 * z_loss
+        else:
+            loss = None
+
+        return CausalLMOutput(logits=logits, loss=loss)
+        
 
 
 #### RoPE implementation (copied and simplified from HuggingFace). ####
