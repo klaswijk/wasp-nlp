@@ -3,7 +3,9 @@ import torch, nltk, pickle
 from torch import nn
 from collections import Counter
 from transformers import BatchEncoding, PretrainedConfig, PreTrainedModel
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutput
+
 from datasets import load_dataset
 from sklearn.decomposition import TruncatedSVD
 from sklearn.manifold import TSNE
@@ -481,9 +483,14 @@ if __name__ == "__main__":
     parser.add_argument("--use_cpu", action="store_true", help="Force the trainer to use the CPU.")
     parser.add_argument("--full_precision", action="store_true", help="Whether to disable mixed precision training (if applicable).")
     parser.add_argument("--a2", action="store_true", help="Whether to use the A2 model instead of the A1 model.")
+    parser.add_argument("--olmo", action="store_true", help="Whether to use a pretrained OLMo-2 model.")
     args = parser.parse_args()
 
-    if args.a2:
+    if args.olmo:
+        model_name = 'allenai/OLMo-2-0425-1B'
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+    elif args.a2:
         Model = A2Transformer
         ModelConfig = A2ModelConfig
     else:
@@ -569,14 +576,15 @@ if __name__ == "__main__":
             sample = torch.multinomial(torch.softmax(logits, dim=-1) / temperature, num_samples=1)
             return sample.unsqueeze(0)
         
-        def top_k_sample(logits, k=10, temperature=1.0):
+        def top_k_sample(logits, k=5, temperature=1.0):
             topk_logits, topk_indices = torch.topk(logits, k)
             idx = torch.multinomial(torch.softmax(topk_logits, dim=-1) / temperature, num_samples=1)
             sample = topk_indices[idx]
             return sample.unsqueeze(0)        
         
-        tokenizer = A1Tokenizer.from_file("tokenizer.pkl")
-        model = Model.from_pretrained(args.output_dir)
+        if not args.olmo:
+            tokenizer = A1Tokenizer.from_file("tokenizer.pkl")
+            model = Model.from_pretrained(args.output_dir)
         model.eval()
 
         # Generate text autoregressively
@@ -608,7 +616,10 @@ if __name__ == "__main__":
                 if next_token_id.item() == tokenizer.eos_token_id:
                     print()
                     break
-                print(tokenizer.int_to_str[next_token_id.item()], end=" ", flush=True)
+                if not args.olmo:
+                    print(tokenizer.int_to_str[next_token_id.item()], end=" ", flush=True)
+                else:
+                    print(tokenizer.decode(next_token_id.item()), end="", flush=True)
         
 
     elif args.task == "nn":
